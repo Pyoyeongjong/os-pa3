@@ -49,6 +49,7 @@ extern struct tlb_entry tlb[1UL << (PTES_PER_PAGE_SHIFT * 2)];
 extern unsigned int mapcounts[];
 
 
+
 /**
  * lookup_tlb(@vpn, @pfn)
  *
@@ -65,7 +66,18 @@ extern unsigned int mapcounts[];
  *   Return false otherwise
  */
 bool lookup_tlb(unsigned int vpn, unsigned int *pfn)
-{
+{	
+	for(int i=0;i<NR_TLB_ENTRIES;i++){
+		if(tlb[i].valid==false){
+			continue;
+		}else{
+			if(tlb[i].vpn==vpn){
+				*pfn=tlb[i].pfn;
+				return true;
+			}
+		}
+	}
+
 	return false;
 }
 
@@ -80,11 +92,17 @@ bool lookup_tlb(unsigned int vpn, unsigned int *pfn)
  */
 void insert_tlb(unsigned int vpn, unsigned int pfn)
 {
+	static int index=0;
+	struct tlb_entry t = {true, vpn, pfn};
+	tlb[index]=t;
+	index++;
+
+	return;
 }
 
 
 /**
- * alloc_page(@vpn, @rw)
+ * alloc_page(@vpn, @rw)re
  *
  * DESCRIPTION
  *   Allocate a page frame that is not allocated to any process, and map it
@@ -101,7 +119,41 @@ void insert_tlb(unsigned int vpn, unsigned int pfn)
  */
 unsigned int alloc_page(unsigned int vpn, unsigned int rw)
 {
-	return -1;
+	unsigned int pfn;
+	for(int i=0;i<NR_PAGEFRAMES;i++){
+		if(mapcounts[i]==0){
+			pfn=i;
+			break;
+		}
+	}
+	int pd_index = vpn / NR_PTES_PER_PAGE; // look at this!!
+	int pte_index = vpn % NR_PTES_PER_PAGE;
+
+	if(pd_index >= NR_PTES_PER_PAGE){
+		return -1;
+	}
+
+	bool isWrite;
+	if(rw==RW_READ){
+		isWrite=false;
+	}else{
+		isWrite=true;
+	}
+	bool wasWrite=isWrite;
+	
+
+	struct pte  p = {true, isWrite, pfn, wasWrite};
+	mapcounts[pfn]++;
+	
+
+	if(!ptbr->outer_ptes[pd_index]){
+		ptbr->outer_ptes[pd_index]=(struct pte_directory*)malloc(sizeof(struct pte)*NR_PTES_PER_PAGE);
+	}
+	struct pte_directory* pd = ptbr->outer_ptes[pd_index];
+	pd->ptes[pte_index] = p;
+	
+	
+	return pfn;
 }
 
 
@@ -116,6 +168,29 @@ unsigned int alloc_page(unsigned int vpn, unsigned int rw)
  */
 void free_page(unsigned int vpn)
 {
+	//tlb valid false
+	for(int i=0;i<NR_TLB_ENTRIES;i++){
+		if(tlb[i].valid==true){
+			if(tlb[i].vpn==vpn){
+				tlb[i].valid=false;
+				break;
+			}
+		}
+	}
+
+	int pd_index = vpn / NR_PTES_PER_PAGE; 
+	int pte_index = vpn % NR_PTES_PER_PAGE;
+
+	struct pte_directory* pd = ptbr->outer_ptes[pd_index];
+	mapcounts[pd->ptes[pte_index].pfn]--;
+	struct pte p = {false,false,0,0};
+	pd->ptes[pte_index].valid = false;
+	pd->ptes[pte_index].writable=false;
+	pd->ptes[pte_index].pfn=0;
+
+	
+
+	return;
 }
 
 
@@ -136,7 +211,24 @@ void free_page(unsigned int vpn)
  *   @false otherwise
  */
 bool handle_page_fault(unsigned int vpn, unsigned int rw)
-{
+{	
+	int pd_index = vpn / NR_PTES_PER_PAGE; 
+	int pte_index = vpn % NR_PTES_PER_PAGE;
+	struct pte p = ptbr->outer_ptes[pd_index]->ptes[pte_index];
+	unsigned int pfn = p.pfn;
+	bool wasWrite = p.private;
+
+	if(rw==RW_WRITE){
+		if(mapcounts[pfn]>1 && wasWrite){
+			free_page(vpn);
+			alloc_page(vpn, rw);
+			return true;
+		}else if(mapcounts[pfn]==1 && wasWrite){
+			free_page(vpn);
+			alloc_page(vpn, rw);
+			return true;
+		}
+	}
 	return false;
 }
 
@@ -161,5 +253,69 @@ bool handle_page_fault(unsigned int vpn, unsigned int rw)
  */
 void switch_process(unsigned int pid)
 {
+	
+	//find pid in processes
+	struct process *pos;
+	
+	bool isfind=false;
+	list_for_each_entry(pos, &processes, list){
+		if(pos->pid==pid){
+			isfind=true;
+			break;
+		}
+	}
+
+	//change
+	if(isfind){
+		list_del_init(&pos->list);
+		list_add_tail(&current->list,&processes);
+		current = pos;
+		ptbr = &current->pagetable;
+
+	}else{//fork
+		list_add_tail(&current->list,&processes);
+		struct pagetable* prev;
+		struct process* fork=(struct process*)malloc(sizeof(struct process));
+
+		prev=&current->pagetable;
+		fork->pid=pid;
+		
+		INIT_LIST_HEAD(&fork->list);
+		ptbr=&fork->pagetable;
+		//copy parent ptbr to child
+		struct pte_directory* pd;
+		for(int i=0;i<NR_PTES_PER_PAGE;i++){
+			if(prev->outer_ptes[i]){
+				if(!ptbr->outer_ptes[i]){
+					ptbr->outer_ptes[i]=(struct pte_directory*)malloc(sizeof(struct pte)*NR_PTES_PER_PAGE);
+				}
+				pd=prev->outer_ptes[i];
+				for(int j=0;j<NR_PTES_PER_PAGE;j++){
+					if(pd->ptes[j].valid==true){
+						struct pte p;
+						pd->ptes[j].writable=false;
+						struct pte copy=pd->ptes[j];
+						
+						//Deep copy
+						p.valid=copy.valid;
+						p.writable=copy.writable;
+						p.pfn=copy.pfn;
+						p.private=copy.private;
+
+						ptbr->outer_ptes[i]->ptes[j]=p;
+						mapcounts[p.pfn]++;
+					}
+				}
+			}
+		}
+		current=fork;
+		
+	}
+	for(int i=0;i<NR_TLB_ENTRIES;i++){
+		if(tlb[i].valid==true){
+			tlb[i].valid=false;
+		}
+	}
+	return;
 }
 

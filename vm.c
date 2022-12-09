@@ -93,7 +93,7 @@ extern void insert_tlb(unsigned int vpn, unsigned int pfn);
  */
 static bool __translate(unsigned int rw, unsigned int vpn, unsigned int *pfn, bool *from_tlb)
 {
-	int pd_index = vpn / NR_PTES_PER_PAGE;
+	int pd_index = vpn / NR_PTES_PER_PAGE; // look at this!!
 	int pte_index = vpn % NR_PTES_PER_PAGE;
 
 	struct pagetable *pt = ptbr;
